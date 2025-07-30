@@ -10,7 +10,7 @@ use bevy::{
     app::{App, Plugin},
     platform::collections::HashMap,
 };
-use spacetimedb_sdk::{DbContext, Table, TableWithPrimaryKey};
+use spacetimedb_sdk::{DbConnectionBuilder, DbContext, Table, TableWithPrimaryKey};
 
 use crate::{
     DeleteEvent, InsertEvent, InsertUpdateEvent, ReducerResultEvent, StdbConnectedEvent,
@@ -19,43 +19,37 @@ use crate::{
 };
 
 /// A function that registers callbacks for events.
-pub type FnRegisterCallbacks<T, C> =
-    fn(&StdbPlugin<T, C>, &mut App, &<T as DbContext>::DbView, &<T as DbContext>::Reducers);
+pub type FnRegisterCallbacks<T, M> =
+    fn(&StdbPlugin<T, M>, &mut App, &<T as DbContext>::DbView, &<T as DbContext>::Reducers);
 
 /// A plugin for SpacetimeDB connections.
-pub struct StdbPlugin<T: DbContext, C>
-where
-    C: Fn(
-        Sender<StdbConnectedEvent>,
-        Sender<StdbDisconnectedEvent>,
-        Sender<StdbConnectionErrorEvent>,
-        &mut App,
-    ) -> T,
-{
+pub struct StdbPlugin<T: DbContext, M: spacetimedb_sdk::__codegen::SpacetimeModule> {
     /// A function that builds a connection to the database.
-    connection_builder: Option<C>,
-    register_events: Option<FnRegisterCallbacks<T, C>>,
+    register_events: Option<FnRegisterCallbacks<T, M>>,
     event_senders: Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
+    build_fn: Option<fn(DbConnectionBuilder<M>) -> spacetimedb_sdk::Result<T>>,
+    run_fn: Option<fn(&T) -> std::thread::JoinHandle<()>>,
 }
 
-impl<TConnection: DbContext, C> StdbPlugin<TConnection, C>
-where
-    C: Fn(
-        Sender<StdbConnectedEvent>,
-        Sender<StdbDisconnectedEvent>,
-        Sender<StdbConnectionErrorEvent>,
-        &mut App,
-    ) -> TConnection,
-{
-    /// Adds your connection builder function, it will be called when the plugin is built.
-    pub fn with_connection(mut self, build_connection: C) -> Self {
-        self.connection_builder = Some(build_connection);
+impl<T: DbContext, M: spacetimedb_sdk::__codegen::SpacetimeModule> StdbPlugin<T, M> {
+    /// Adds a function to register all events required by a Bevy application
+    pub fn with_events(mut self, register_callbacks: FnRegisterCallbacks<T, M>) -> Self {
+        self.register_events = Some(register_callbacks);
         self
     }
 
-    /// Adds a function to register all events required by a Bevy application
-    pub fn with_events(mut self, register_callbacks: FnRegisterCallbacks<TConnection, C>) -> Self {
-        self.register_events = Some(register_callbacks);
+    /// Adds a builder function to build the StdbConnection with.
+    pub fn with_build_fn(
+        mut self,
+        build_fn: fn(DbConnectionBuilder<M>) -> spacetimedb_sdk::Result<T>,
+    ) -> Self {
+        self.build_fn = Some(build_fn);
+        self
+    }
+
+    /// TODO!
+    pub fn with_run_fn(mut self, run_fn: fn(&T) -> std::thread::JoinHandle<()>) -> Self {
+        self.run_fn = Some(run_fn);
         self
     }
 
@@ -197,38 +191,8 @@ where
     }
 }
 
-impl<T: DbContext, C> Default for StdbPlugin<T, C>
-where
-    C: Send
-        + Sync
-        + 'static
-        + Fn(
-            Sender<StdbConnectedEvent>,
-            Sender<StdbDisconnectedEvent>,
-            Sender<StdbConnectionErrorEvent>,
-            &mut App,
-        ) -> T,
-{
-    fn default() -> Self {
-        Self {
-            connection_builder: None,
-            register_events: None,
-            event_senders: Mutex::new(HashMap::new()),
-        }
-    }
-}
-
-impl<T: DbContext + Send + Sync + 'static, C> Plugin for StdbPlugin<T, C>
-where
-    C: Send
-        + Sync
-        + 'static
-        + Fn(
-            Sender<StdbConnectedEvent>,
-            Sender<StdbDisconnectedEvent>,
-            Sender<StdbConnectionErrorEvent>,
-            &mut App,
-        ) -> T,
+impl<T: DbContext + Send + Sync + 'static, M: spacetimedb_sdk::__codegen::SpacetimeModule> Plugin
+    for StdbPlugin<T, M>
 {
     fn build(&self, app: &mut App) {
         let (send_connected, recv_connected) = channel::<StdbConnectedEvent>();
@@ -239,15 +203,53 @@ where
             .add_event_channel::<StdbConnectedEvent>(recv_connected)
             .add_event_channel::<StdbDisconnectedEvent>(recv_disconnected);
 
-        let conn_builder = self
-            .connection_builder
-            .as_ref()
-            .expect("Connection builder is not set, use with_connection() method");
-        let conn = conn_builder(send_connected, send_disconnected, send_connect_error, app);
+        // let conn_builder = self
+        //     .connection_builder
+        //     .as_ref()
+        //     .expect("Connection builder is not set, use with_connection() method");
+        // let conn = conn_builder(send_connected, send_disconnected, send_connect_error, app);
+
+        let conn_builder = DbConnectionBuilder::new();
+
+        let conn_builder = conn_builder
+            .with_module_name("tic")
+            .with_uri("http://localhost:3000")
+            .on_connect_error(move |_ctx, err| {
+                send_connect_error
+                    .send(StdbConnectionErrorEvent { err })
+                    .unwrap();
+            })
+            .on_disconnect(move |_ctx, err| {
+                send_disconnected
+                    .send(StdbDisconnectedEvent { err })
+                    .unwrap();
+            })
+            .on_connect(move |_ctx, id, token| {
+                send_connected
+                    .send(StdbConnectedEvent {
+                        identity: id,
+                        access_token: token.to_string(),
+                    })
+                    .unwrap();
+            });
+
+        let build_fn = self
+            .build_fn
+            .ok_or("Build function must be set in StdbPlugin")
+            .unwrap();
+
+        let conn = build_fn(conn_builder).unwrap();
+
+        let run_fn = self
+            .run_fn
+            .ok_or("Run function must be set in StdbPlugin")
+            .unwrap();
 
         if let Some(register_callbacks) = self.register_events {
             register_callbacks(self, app, conn.db(), conn.reducers());
         }
+
+        run_fn(&conn);
 
         app.insert_resource(StdbConnection::new(conn));
     }

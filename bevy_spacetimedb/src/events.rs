@@ -1,3 +1,5 @@
+use std::marker::PhantomData;
+
 use bevy::prelude::Event;
 use spacetimedb_sdk::{Error, Identity};
 
